@@ -1,209 +1,158 @@
-# 🛡️ VoC Risk Sentinel
+# VoC Risk Sentinel
 
-> **리워드 광고 플랫폼을 위한 VoC 리스크 자동 분류 시스템**
-> Rule-based 필터링과 Gemini 2.5 Flash를 결합한 하이브리드 파이프라인으로 법적 위험·시스템 결함·어뷰징 패턴을 자동 탐지하고, 실시간 대시보드로 시각화합니다.
+리워드 광고 플랫폼의 고객 문의(VoC)를 **자동으로 리스크 분류**하는 하이브리드 파이프라인입니다.
 
----
-
-## ✨ 주요 기능
-
-- **하이브리드 파이프라인** — Rule-based 1차 필터링으로 고위험 후보를 추출한 뒤, LLM으로 정밀 분석. LLM 호출량을 전수 분석 대비 **최대 90% 절감**
-- **5단계 리스크 분류** — Critical(법적) / High(시스템) / Medium(어뷰징) / Low(일반) / Grey Zone
-- **실시간 대시보드** — Streamlit + Plotly 기반 다크모드 UI, KPI 카드·도넛 차트·인터랙티브 테이블
-- **Checkpoint 재시도** — 처리 중 중단 시 완료 건 자동 스킵, 실패 건만 재시도
-- **미탐율 방어** — 필터 통과 건 5% 랜덤 LLM 감사로 키워드 우회 케이스 보완
+Rule-based 키워드 필터링으로 고위험 건을 1차 선별한 뒤, **Gemini 2.0 Flash**로 정밀 분석하여 Critical / High / Medium / Low / Grey Zone 5단계로 등급을 판정합니다. 전량 LLM 분석 대비 **약 70~90%의 API 호출을 절감**하면서도 고위험 건의 누락을 방지합니다.
 
 ---
 
-## 📁 프로젝트 구조
+## 프로젝트 구조
 
 ```
-voc-priority-automation/
-├── app.py                        # Streamlit 대시보드 (메인 진입점)
-├── requirements.txt              # 의존성 패키지
-├── .env.example                  # 환경변수 템플릿
+voc-risk-sentinel/
+├── .env.example          # API Key 설정 템플릿
 ├── .gitignore
-│
-├── src/
-│   ├── 01_synthetic_data_gen.py  # 합성 데이터 4,000건 생성
-│   ├── 02_analyze_voc.py         # 파이프라인 v1 (참고용)
-│   ├── analyze_voc.py            # 파이프라인 v2 (현재 사용)
-│   └── check_model.py            # 사용 가능한 모델 목록 확인
-│
-└── data/
-    └── sample_voc_100.csv        # 샘플 데이터 100건 (데모용)
+├── requirements.txt
+├── gen_data.py           # Step 0: 합성 VoC 데이터 300건 생성
+├── analyze_voc.py        # Step 1~3: 하이브리드 분석 파이프라인
+├── data/
+│   └── voc_data_300.csv  # 생성된 합성 데이터
+└── outputs/
+    ├── voc_results.jsonl       # 분석 결과 (JSON Lines)
+    └── evaluation_report.txt   # 검증 보고서
 ```
-
-> **전체 데이터(`voc_data_4000.csv`)** 는 `src/01_synthetic_data_gen.py`를 실행하여 직접 생성하세요.
 
 ---
 
-## 🚀 빠른 시작
+## 파이프라인 흐름
 
-### 1. 저장소 클론
-
-```bash
-git clone https://github.com/<your-username>/voc-priority-automation.git
-cd voc-priority-automation
+```
+[300건 VoC 합성데이터]
+        │
+        ▼
+┌──────────────────────────┐
+│  Step 1: Rule-based      │  키워드 매칭 + 로그 패턴 분석
+│  Pre-Filtering           │  → 고위험 후보 추출
+└──────────┬───────────────┘
+           ▼
+┌──────────────────────────┐
+│  Step 2: LLM Precision   │  Gemini 2.5 Flash
+│  Scoring                 │  → risk_level + risk_score + reasoning
+└──────────┬───────────────┘
+           ▼
+┌──────────────────────────┐
+│  미탐율 방어 (5% 감사)     │  나머지 건에서 랜덤 샘플링
+└──────────┬───────────────┘
+           ▼
+   [voc_results.jsonl]
+   [evaluation_report.txt]
 ```
 
-### 2. 가상환경 생성 및 의존성 설치
+---
+
+## 빠른 시작
+
+### 1. 클론 및 의존성 설치
 
 ```bash
+git clone https://github.com/<your-username>/voc-risk-sentinel.git
+cd voc-risk-sentinel
+
 python -m venv .venv
-
-# macOS / Linux
-source .venv/bin/activate
-
-# Windows
-.venv\Scripts\activate
-
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. API Key 설정 ⚠️
+### 2. API Key 설정
+
+[Google AI Studio](https://aistudio.google.com/apikey)에서 Gemini API Key를 발급받은 뒤, 프로젝트 루트에 `.env` 파일을 생성합니다.
 
 ```bash
-# 템플릿 복사
 cp .env.example .env
 ```
 
-`.env` 파일을 열어 실제 Gemini API Key를 입력하세요:
+`.env` 파일을 열어 실제 키를 입력합니다:
 
-```dotenv
-GEMINI_API_KEY=your_gemini_api_key_here
+```
+GEMINI_API_KEY=AIzaSy...실제_키_값
 ```
 
-> **Gemini API Key 발급**: [Google AI Studio](https://aistudio.google.com/app/apikey) 에서 무료로 발급받을 수 있습니다.
-> ⚠️ `.env` 파일은 절대 Git에 커밋하지 마세요. `.gitignore`에 포함되어 있습니다.
+> **주의:** `.env` 파일은 `.gitignore`에 의해 Git 추적에서 제외됩니다. 절대 GitHub에 업로드하지 마세요.
 
-### 4. 데이터 생성 (선택)
+> **API Key 없이도 실행 가능합니다.** Key가 없으면 자동으로 Rule-based 모드로 전환되어 동작합니다.
+
+### 3. 실행
 
 ```bash
-# 합성 데이터 4,000건 생성 (src/voc_data_4000.csv 생성됨)
-cd src
-python 01_synthetic_data_gen.py
+# Step 0: 합성 데이터 생성 (300건)
+python gen_data.py
+
+# Step 1~3: 분석 파이프라인 실행
+python analyze_voc.py
 ```
 
-> 빠른 테스트는 `data/sample_voc_100.csv`(100건)를 사용하세요.
-
-### 5. 파이프라인 실행 (VoC 분류)
-
-```bash
-cd src
-
-# 샘플 100건으로 테스트
-python analyze_voc.py ../data/sample_voc_100.csv
-
-# 전체 4,000건 실행
-python analyze_voc.py voc_data_4000.csv
-
-# 체크포인트 초기화 후 처음부터 재실행
-python analyze_voc.py voc_data_4000.csv --reset
-```
-
-분석 완료 시 `src/voc_results.jsonl`이 생성됩니다.
-
-### 6. 대시보드 실행
-
-```bash
-# 프로젝트 루트에서 실행
-streamlit run app.py
-```
-
-브라우저에서 `http://localhost:8501` 접속
+실행이 완료되면 `outputs/` 폴더에 결과가 저장됩니다.
 
 ---
 
-## ☁️ Streamlit Cloud 배포
+## 리스크 등급 체계
 
-Streamlit Cloud에 배포하면 별도 서버 없이 대시보드를 공개할 수 있습니다.
-
-### 배포 전 준비
-
-1. `voc_results.jsonl` 분석 결과 파일을 저장소에 포함시키거나, 대시보드가 샘플 데이터를 읽도록 설정
-2. GitHub 저장소에 코드 푸시
-
-### 배포 단계
-
-1. [share.streamlit.io](https://share.streamlit.io) 접속 후 GitHub 계정 연동
-2. **New app** → 저장소/브랜치 선택 → Main file path: `app.py`
-3. **Advanced settings → Secrets** 에 API Key 입력:
-
-```toml
-GEMINI_API_KEY = "your_gemini_api_key_here"
-```
-
-> Streamlit Cloud에서는 `.env` 대신 **Secrets** 기능을 사용합니다.
-> `app.py`는 `os.getenv()`로 환경변수를 읽으므로 Secrets가 자동으로 적용됩니다.
-
-4. **Deploy** 클릭
+| 등급 | 점수 | 정의 | 대응 방식 |
+|------|------|------|-----------|
+| **Critical** | 81~100 | 법적 대응 언급 (금감원, 소송 등) | 즉시 에스컬레이션 + 정책 변경 검토 |
+| **High** | 61~80 | 외부 기관 신고 위협, 심한 욕설 | 24시간 내 대응 + 원인 분석 |
+| **Medium** | 41~60 | 시스템 오류, 기술적 확인 필요 | 일반 대응 프로세스 |
+| **Low** | 0~40 | 단순 미지급, FAQ 해결 가능 | 자동응답 처리 |
+| **Grey Zone** | 판단 유보 | 어뷰징 의심, 증거 불충분 | 추가 조사 후 판정 |
 
 ---
 
-## 🧠 파이프라인 상세
+## 합성 데이터 구성
 
-### 하이브리드 아키텍처
-
-```
-[VoC 원시 데이터]
-      │
-      ▼
-┌─────────────────────┐
-│  Rule-based Filter  │  키워드 매칭 + 로그 패턴
-│  (Step 1)           │  → 고위험 후보 5~10% 추출
-└──────────┬──────────┘
-           │ ~200~400건
-           ▼
-┌─────────────────────┐
-│  LLM Precision      │  Gemini 2.5 Flash
-│  Scoring (Step 2)   │  → Risk Score 1~5 + Reasoning
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  미탐율 방어 감사    │  필터 통과 건 5% 랜덤 LLM 검증
-└─────────────────────┘
-```
-
-### 리스크 등급 기준
-
-| Score | 등급 | 유형 | 판단 기준 |
-|:---:|------|------|----------|
-| 5 | **Critical** | `legal` | 금감원·고소·소송·법적조치 언급 |
-| 4 | **High** | `system` | 포인트 미지급 + 로그 불일치 반복 |
-| 3 | **Medium** | `abuse` / `system` | 어뷰징 의심, 반복 문의 3회↑ |
-| 2 | **Low** | `normal` | 일반 서비스 문의 |
-| 1 | **Minimal** | `normal` | 단순 정보 요청 |
-
-### 토큰 최적화 기법
-
-- `thinking_budget=0` — Flash 모델 사고 토큰 완전 차단
-- `response_schema` — JSON 구조 API 레벨 강제, 포맷 설명 불필요
-- 시스템 프롬프트 ~30 tokens (기존 대비 75% 압축)
-- `max_output_tokens=80` — 최솟값 제한
-
----
-
-## ⚙️ 환경 요구사항
-
-- Python 3.11 이상 (개발: 3.13)
-- Gemini API Key ([Google AI Studio](https://aistudio.google.com/app/apikey))
-- 주요 패키지: `google-genai`, `streamlit`, `plotly`, `pandas`
-
----
-
-## 📊 실제 실행 결과 (4,000건 기준)
-
-| 항목 | 수치 |
+| 항목 | 분포 |
 |------|------|
-| LLM 처리 대상 | 1,543건 (전체 38.6%) |
-| LLM 비용 절감 | **~90%** (전수 분석 대비) |
-| LLM 실패율 | 0% |
-| 즉시 대응 필요 (Score 5) | 265건 |
+| 리스크 등급 | Low 60%, Grey 25%, Medium 10%, High 3%, Critical 2% |
+| 카테고리 | 리워드미지급 80%, 광고참여불가 15%, 기타 5% |
+| 광고 유형 | CPA 80%, CPS 5%, CPI/CPE 10%, 기타 5% |
+| 욕설 포함 | 약 10% |
 
 ---
 
-## 📄 라이선스
+## 토큰 최적화 전략
 
-MIT License
+| 기법 | 효과 |
+|------|------|
+| Rule-based 1차 필터링 | 전체의 약 25~30%만 LLM에 투입 |
+| `response_schema` 적용 | 구조화된 JSON 출력 강제, 파싱 실패 방지 |
+| `thinking_budget=0` | 추론 토큰 비용 제거 |
+| 시스템 프롬프트 압축 | 분류 기준 핵심만 전달 (불필요 수식어 제거) |
+| 5% 랜덤 감사 | 미탐율 방어 + 최소 비용 |
+
+---
+
+## Streamlit Cloud 배포
+
+1. GitHub에 push한 뒤 [Streamlit Cloud](https://streamlit.io/cloud)에서 레포를 연결합니다.
+2. **Secrets 설정:** Streamlit Cloud 대시보드 → Settings → Secrets에 아래 내용을 추가합니다:
+   ```toml
+   GEMINI_API_KEY = "AIzaSy...실제_키_값"
+   ```
+3. 대시보드 앱 파일을 지정하고 Deploy를 클릭합니다.
+
+---
+
+## 기술 스택
+
+| 영역 | 기술 |
+|------|------|
+| 언어 | Python 3.11+ |
+| LLM | Google Gemini 2.5 Flash (`google-genai`) |
+| 데이터 | pandas, CSV/JSONL |
+| 대시보드 | Streamlit, Plotly |
+| 환경 관리 | python-dotenv |
+
+---
+
+## 라이선스
+
+이 프로젝트는 포트폴리오 목적으로 제작되었습니다. 실제 회사 데이터는 포함되어 있지 않으며, 모든 VoC 데이터는 합성(Synthetic) 데이터입니다.

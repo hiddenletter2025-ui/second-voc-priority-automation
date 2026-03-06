@@ -1,337 +1,483 @@
 """
-VoC Risk Auto-Classification Pipeline v2
-Hybrid: Rule-based Filter → LLM Precision Scoring
-
-[버그 수정 v1→v2]
-  1. api_version 'v1' → 'v1beta': v1은 systemInstruction/responseMimeType 미지원 (모든 호출 400 실패 원인)
-  2. 컬럼명 수정: content→voc_content, log_status→log_matching, repeat_count→daily_query_cnt
-  3. 로그 판단값 수정: '없음' → 'No_Record'
-  4. 실패 건은 체크포인트 미기록 (재실행 시 자동 재시도)
-  5. 결과 없는데 체크포인트만 있으면 자동 초기화
-
-[2026 최적화]
-  - gemini-2.5-flash 업그레이드
-  - thinking_budget=0: 사고 토큰 완전 차단 (Flash 특화 토큰 절감)
-  - response_schema: JSON 구조 강제 → 시스템 프롬프트 포맷 설명 불필요
-  - 시스템 프롬프트: ~30 tokens로 압축
+analyze_voc.py — 하이브리드 VoC 리스크 분석 파이프라인
+=====================================================
+Step 1: Rule-based Pre-Filtering  (키워드 + 로그 패턴)
+Step 2: LLM Precision Scoring     (Gemini 2.0 Flash, 고위험 + 5% 감사)
+Step 3: 결과 저장 + 검증 보고서 생성
 """
 
-import os
+import csv
 import json
+import os
+import random
+import sys
 import time
-import logging
+from collections import Counter, defaultdict
 from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass, asdict
-from typing import Optional
 
-import pandas as pd
-from tqdm import tqdm
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 
-load_dotenv()
+# google-genai는 선택적 의존성 — 미설치 시 Rule-only 모드로 동작
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# tqdm 선택적 — 미설치 시 간단한 fallback
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, desc="", **kwargs):
+        total = len(iterable) if hasattr(iterable, "__len__") else "?"
+        for i, item in enumerate(iterable, 1):
+            print(f"\r  {desc} [{i}/{total}]", end="", flush=True)
+            yield item
+        print()
 
-MODEL_ID       = "gemini-2.5-flash"
-CHECKPOINT_DIR = Path("checkpoints")
-OUTPUT_PATH    = Path("voc_results.jsonl")
-MAX_RETRIES    = 3
-RETRY_DELAY    = 5        # seconds (지수 백오프 base)
-RANDOM_AUDIT   = 0.05    # 미탐율 방어: 필터 통과 건 5% 랜덤 LLM 감사
+# ─── 경로 설정 ──────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+DATA_FILE = BASE_DIR / "data" / "voc_data_300.csv"
+OUTPUT_DIR = BASE_DIR / "outputs"
+RESULTS_FILE = OUTPUT_DIR / "voc_results.jsonl"
+REPORT_FILE = OUTPUT_DIR / "evaluation_report.txt"
 
-# FIX: v1 → v1beta (systemInstruction, responseMimeType, ThinkingConfig 지원)
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    http_options=types.HttpOptions(api_version="v1beta"),
-)
+# ─── 환경 변수 ──────────────────────────────────────────────
+load_dotenv(BASE_DIR / ".env")
+API_KEY = os.getenv("GEMINI_API_KEY")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("pipeline.log", encoding="utf-8"),
-    ],
-)
-log = logging.getLogger(__name__)
+# ─── Gemini 클라이언트 초기화 ────────────────────────────────
+LLM_AVAILABLE = False
+client = None
+MODEL_ID = "gemini-2.5-flash"
 
+if HAS_GENAI and API_KEY:
+    try:
+        client = genai.Client(api_key=API_KEY)
+        LLM_AVAILABLE = True
+        print("✅ Gemini API 연결 완료")
+    except Exception as e:
+        print(f"⚠ Gemini 초기화 실패 ({e}) — Rule-only 모드로 실행합니다.")
+else:
+    if not HAS_GENAI:
+        print("⚠ google-genai 미설치 — Rule-only 모드로 실행합니다.")
+    elif not API_KEY:
+        print("⚠ GEMINI_API_KEY 미설정 — Rule-only 모드로 실행합니다.")
+        print("  → .env 파일에 GEMINI_API_KEY=your_key 를 설정하세요.")
 
-# ── Data Model ────────────────────────────────────────────────────────────────
-
-@dataclass
-class RiskResult:
-    voc_id: str
-    risk_score: int       # 1~5 (5=즉시대응)
-    risk_type: str        # legal | system | abuse | normal
-    reason: str           # 15자 이내 한 문장
-    triggered_by: str     # rule | audit
-    processed_at: str
-
-
-# ── LLM Schema & Config (재사용 객체) ─────────────────────────────────────────
-
-# response_schema: JSON 구조를 API 레벨에서 강제
-# → 시스템 프롬프트에 출력 포맷 설명할 필요 없음 → 토큰 절감
-RISK_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "score":  {"type": "integer"},
-        "type":   {"type": "string", "enum": ["legal", "system", "abuse", "normal"]},
-        "reason": {"type": "string"},
-    },
-    "required": ["score", "type", "reason"],
-}
-
-# 극한 압축 시스템 프롬프트 (~30 tokens)
-# 포맷 설명 제거 (response_schema가 대체), 판단 기준만 최소 서술
-SYSTEM_PROMPT = (
-    "리워드광고 VoC 리스크 분류기."
-    " score:1~5(5=법적·즉시대응,1=단순문의)."
-    " reason:15자이내 한국어."
-)
-
-LLM_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    temperature=0.0,           # 결정론적 출력
-    max_output_tokens=80,      # JSON 4필드면 충분
-    response_mime_type="application/json",
-    response_schema=RISK_SCHEMA,
-    thinking_config=types.ThinkingConfig(thinking_budget=0),  # 사고 토큰 차단
-)
+# ─── Rule-based 키워드 사전 ──────────────────────────────────
+CRITICAL_KEYWORDS = [
+    "금감원", "고소", "법적 조치", "법적 대응", "소송", "변호사",
+    "위법", "고소장", "법적 절차",
+]
+HIGH_KEYWORDS = [
+    "소비자원", "소비자보호원", "민원", "신고",
+    "커뮤니티에 다 올", "커뮤니티에 올리",
+]
+PROFANITY_KEYWORDS = [
+    "ㅅㅂ", "ㅆㅂ", "씨발", "개같", "개짜증", "미친",
+    "존나", "병신", "지랄",
+]
+MEDIUM_KEYWORDS = [
+    "화면이 하얗", "백화", "무한 로딩", "클릭 불가",
+    "앱이 꺼", "시스템 문제", "트래킹", "단계부터",
+    "앱이 자꾸 튕",
+]
 
 
-# ── Step 1: Rule-based Filter ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  Step 1: Rule-based Pre-Filtering
+# ═══════════════════════════════════════════════════════════════
 
-def normalize(text: str) -> str:
-    """공백·대소문자 제거 (키워드 우회 방어)"""
-    import re, unicodedata
-    text = unicodedata.normalize("NFC", str(text))
-    return re.sub(r"[\s·\.]+", "", text.lower())  # 공백·점·중점 제거
-
-LEGAL_KW  = {"금감원","고소","사기","소송","법적조치","변호사","민원","공정위","경찰","신고","형사"}
-SYSTEM_KW = {"오류","버그","앱크래시","미지급","포인트안됨","결제오류","백화현상","클릭불가","팅김"}
-ABUSE_KW  = {"다계정","대리","매크로","어뷰징","허위","조작","타인명의","환급","중복참여"}
+def _contains_any(text: str, keywords: list[str]) -> bool:
+    return any(kw in text for kw in keywords)
 
 
-def classify_rule(row) -> Optional[str]:
-    # FIX: content → voc_content
-    text = normalize(row.get("voc_content", ""))
-    # FIX: log_status → log_matching, 값 비교 '없음' → 'No_Record'
-    no_log = str(row.get("log_matching", "")).strip() == "No_Record"
-    # FIX: repeat_count → daily_query_cnt
-    cnt    = int(row.get("daily_query_cnt", 0))
+def rule_based_classify(row: dict) -> dict:
+    """
+    규칙 기반 1차 분류. 반환값에 'rule_flag' 포함.
+    - 'critical' / 'high' / 'medium' / 'grey_suspect' / 'low'
+    """
+    content = row["voc_content"]
+    log_match = row["log_matching"]
+    daily_cnt = int(row["daily_query_cnt"])
 
-    if any(k in text for k in LEGAL_KW):
-        return "legal"
-    if any(k in text for k in ABUSE_KW):
-        return "abuse"
-    if any(k in text for k in SYSTEM_KW) or (no_log and cnt >= 3):
-        return "system"
-    return None
+    # Grey Zone 패턴: 로그 없음 + 문의 빈도 ≥ 10
+    if log_match == "No_Record" and daily_cnt >= 10:
+        return {**row, "rule_flag": "grey_suspect"}
+
+    if _contains_any(content, CRITICAL_KEYWORDS):
+        return {**row, "rule_flag": "critical"}
+
+    if _contains_any(content, HIGH_KEYWORDS):
+        return {**row, "rule_flag": "high"}
+
+    if _contains_any(content, PROFANITY_KEYWORDS):
+        return {**row, "rule_flag": "high"}
+
+    if _contains_any(content, MEDIUM_KEYWORDS):
+        return {**row, "rule_flag": "medium"}
+
+    return {**row, "rule_flag": "low"}
 
 
-def rule_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """Rule 기반 고위험 후보 추출 + 랜덤 감사 샘플 추가 (미탐율 방어)"""
-    df = df.copy()
-    df["_rule_type"] = df.apply(classify_rule, axis=1)
+def step1_filter(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """고위험 후보 + 나머지를 분리하여 반환."""
+    high_risk = []
+    rest = []
 
-    high_risk = df[df["_rule_type"].notna()].copy()
-    high_risk["triggered_by"] = "rule"
+    for row in rows:
+        classified = rule_based_classify(row)
+        if classified["rule_flag"] in ("critical", "high", "grey_suspect"):
+            high_risk.append(classified)
+        else:
+            rest.append(classified)
 
-    rest    = df[df["_rule_type"].isna()]
-    audit_n = max(1, int(len(rest) * RANDOM_AUDIT))
-    audit   = rest.sample(n=audit_n, random_state=42).copy()
-    audit["_rule_type"]   = "unknown"
-    audit["triggered_by"] = "audit"
+    return high_risk, rest
 
-    candidates = pd.concat([high_risk, audit]).reset_index(drop=True)
-    log.info(
-        f"Rule filter: {len(high_risk)}건 고위험 "
-        f"+ {len(audit)}건 감사 = {len(candidates)}건 LLM 대상"
+
+# ═══════════════════════════════════════════════════════════════
+#  Step 2: LLM Precision Scoring (Gemini 2.0 Flash)
+# ═══════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT = """리워드 광고 플랫폼 VoC 리스크 분류기.
+
+## 등급 기준
+- Critical(81-100): 법적 대응 언급(금감원/고소/소송), 서비스 전체 마비, 심각한 금전 손실
+- High(61-80): 외부 기관 신고 언급(소비자원/민원), 심한 욕설, 대형 파트너사 반복 결함
+- Medium(41-60): 시스템 오류(백화/무한로딩/클릭불가), 트래킹 누락, 기술 확인 필요
+- Low(0-40): 단순 리워드 미지급, FAQ 해결 가능 문의
+- Grey(판단유보): log_matching=No_Record + daily_query_cnt≥10 (어뷰징 의심), 증빙 조작 의심, 동일 패턴 복수 계정
+
+## 판단 시 참조
+- log_matching: Match(정상) / No_Record(로그 없음)
+- daily_query_cnt: 해당 유저의 일 문의 횟수 (10 이상이면 어뷰징 의심)
+- 욕설 단독으로는 High 이하. 법적 키워드 동반 시 Critical.
+
+반드시 JSON으로만 응답."""
+
+RESPONSE_SCHEMA = None
+if HAS_GENAI:
+    RESPONSE_SCHEMA = types.Schema(
+        type="OBJECT",
+        properties={
+            "risk_level": types.Schema(
+                type="STRING",
+                enum=["Critical", "High", "Medium", "Low", "Grey"],
+            ),
+            "risk_score": types.Schema(type="INTEGER"),
+            "is_grey_zone": types.Schema(type="BOOLEAN"),
+            "reasoning": types.Schema(type="STRING"),
+        },
+        required=["risk_level", "risk_score", "is_grey_zone", "reasoning"],
     )
-    return candidates
 
 
-# ── Step 2: LLM Analysis ──────────────────────────────────────────────────────
-
-def build_user_message(row: pd.Series) -> str:
-    """입력 토큰 최소화: 300자 컷 + JSON 인라인"""
-    text = str(row.get("voc_content", ""))[:300].replace('"', "'").replace("\n", " ")
+def build_user_prompt(row: dict) -> str:
     return (
-        f'{{"id":"{row.get("voc_id","")}","text":"{text}",'
-        f'"log":"{str(row.get("log_matching",""))[:20]}",'
-        f'"cnt":{int(row.get("daily_query_cnt", 0))}}}'
+        f"[VoC 분석 요청]\n"
+        f"voc_content: {row['voc_content']}\n"
+        f"ad_type: {row['ad_type']}\n"
+        f"ad_name: {row['ad_name']}\n"
+        f"category: {row['category']}\n"
+        f"log_matching: {row['log_matching']}\n"
+        f"daily_query_cnt: {row['daily_query_cnt']}"
     )
 
 
-def call_llm(row: pd.Series) -> Optional[dict]:
-    """단일 VoC LLM 호출 (재시도 + 지수 백오프)"""
-    user_msg = build_user_message(row)
-    vid = row.get("voc_id", "?")
+def rule_fallback_score(row: dict) -> dict:
+    """LLM 미사용 시 Rule 기반 상세 스코어링 (폴백)."""
+    content = row["voc_content"]
+    log_match = row["log_matching"]
+    daily_cnt = int(row["daily_query_cnt"])
+    flag = row.get("rule_flag", "low")
 
-    for attempt in range(MAX_RETRIES):
+    if flag == "critical" or _contains_any(content, CRITICAL_KEYWORDS):
+        return {"risk_level": "Critical", "risk_score": 90, "is_grey_zone": False,
+                "reasoning": "법적 대응 관련 키워드 탐지 (Rule-based)"}
+    if flag == "high" or _contains_any(content, HIGH_KEYWORDS + PROFANITY_KEYWORDS):
+        score = 70
+        if _contains_any(content, PROFANITY_KEYWORDS):
+            score = 75
+        return {"risk_level": "High", "risk_score": score, "is_grey_zone": False,
+                "reasoning": "외부 신고 위협 또는 욕설 탐지 (Rule-based)"}
+    if flag == "grey_suspect" or (log_match == "No_Record" and daily_cnt >= 10):
+        return {"risk_level": "Grey", "risk_score": 55, "is_grey_zone": True,
+                "reasoning": f"어뷰징 의심 — 로그 미일치 + 일 문의 {daily_cnt}회 (Rule-based)"}
+    if flag == "medium" or _contains_any(content, MEDIUM_KEYWORDS):
+        return {"risk_level": "Medium", "risk_score": 50, "is_grey_zone": False,
+                "reasoning": "시스템 오류/기술적 확인 필요 (Rule-based)"}
+    return {"risk_level": "Low", "risk_score": 20, "is_grey_zone": False,
+            "reasoning": "단순 문의 — Rule-based 자동 분류"}
+
+
+def call_gemini(row: dict, max_retries: int = 3) -> dict:
+    """Gemini 2.0 Flash 호출 (v1beta + response_schema + thinking_budget=0).
+    LLM 미사용 환경에서는 rule_fallback_score로 대체."""
+    if not LLM_AVAILABLE:
+        return rule_fallback_score(row)
+
+    user_prompt = build_user_prompt(row)
+
+    for attempt in range(max_retries):
         try:
-            resp = client.models.generate_content(
+            response = client.models.generate_content(
                 model=MODEL_ID,
-                contents=user_msg,
-                config=LLM_CONFIG,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=RESPONSE_SCHEMA,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    temperature=0.1,
+                ),
             )
-            return json.loads(resp.text)
 
-        except json.JSONDecodeError as e:
-            log.warning(f"[{vid}] JSON 파싱 실패 (시도 {attempt+1}): {e}")
+            result = json.loads(response.text)
+            return {
+                "risk_level": result.get("risk_level", "Low"),
+                "risk_score": result.get("risk_score", 0),
+                "is_grey_zone": result.get("is_grey_zone", False),
+                "reasoning": result.get("reasoning", ""),
+            }
 
         except Exception as e:
-            log.warning(f"[{vid}] API 오류 (시도 {attempt+1}): {e}")
-            if attempt < MAX_RETRIES - 1:
-                wait = RETRY_DELAY * (2 ** attempt)
-                log.info(f"[{vid}] {wait}초 후 재시도...")
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                print(f"   ⚠ API 오류 (attempt {attempt+1}): {e} — {wait}초 후 재시도")
                 time.sleep(wait)
-
-    log.error(f"[{vid}] 최대 재시도 초과 → fallback (수동 검토 큐)")
-    return None
-
-
-# ── Checkpoint 관리 ───────────────────────────────────────────────────────────
-
-def load_done_ids() -> set:
-    """성공적으로 처리된 voc_id 집합 반환"""
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
-    done = {f.stem for f in CHECKPOINT_DIR.glob("*.done")}
-    if done:
-        log.info(f"Checkpoint: {len(done)}건 이미 처리됨 → 스킵")
-    return done
+            else:
+                print(f"   ❌ API 최종 실패 — Rule-based 폴백 적용: {e}")
+                return rule_fallback_score(row)
 
 
-def mark_done(voc_id: str):
-    """성공 건만 체크포인트 기록 (실패 건은 재실행 시 재시도)"""
-    (CHECKPOINT_DIR / f"{voc_id}.done").touch()
+def step2_llm_analysis(
+    high_risk: list[dict],
+    rest: list[dict],
+    audit_rate: float = 0.05,
+) -> list[dict]:
+    """
+    고위험 후보 전량 + 나머지의 5%를 LLM으로 분석.
+    나머지는 rule_flag 기반 기본값 부여.
+    """
+    # 5% 랜덤 감사 샘플
+    audit_count = max(1, int(len(rest) * audit_rate))
+    audit_sample = random.sample(rest, min(audit_count, len(rest)))
+    audit_ids = {r["voc_id"] for r in audit_sample}
+
+    llm_targets = high_risk + audit_sample
+    print(f"\n🔍 LLM 분석 대상: {len(llm_targets)}건 "
+          f"(고위험 {len(high_risk)} + 감사 {len(audit_sample)})")
+
+    results = []
+
+    # LLM 분석 대상
+    for row in tqdm(llm_targets, desc="🤖 Gemini 분석 중"):
+        llm_result = call_gemini(row)
+        results.append({
+            "voc_id": row["voc_id"],
+            "created_at": row["created_at"],
+            "user_id": row["user_id"],
+            "publisher": row.get("publisher", ""),
+            "ad_type": row["ad_type"],
+            "ad_name": row["ad_name"],
+            "category": row["category"],
+            "voc_content": row["voc_content"],
+            "log_matching": row["log_matching"],
+            "daily_query_cnt": int(row["daily_query_cnt"]),
+            "actual_risk_level": row["actual_risk_level"],
+            "rule_flag": row["rule_flag"],
+            "analyzed_by": "LLM",
+            **llm_result,
+        })
+        time.sleep(0.3)  # Rate limit 방어
+
+    # 나머지 (Rule-only)
+    rule_level_map = {"low": "Low", "medium": "Medium"}
+    rule_score_map = {"low": 20, "medium": 50}
+
+    for row in rest:
+        if row["voc_id"] in audit_ids:
+            continue  # 이미 LLM 분석됨
+        flag = row["rule_flag"]
+        results.append({
+            "voc_id": row["voc_id"],
+            "created_at": row["created_at"],
+            "user_id": row["user_id"],
+            "publisher": row.get("publisher", ""),
+            "ad_type": row["ad_type"],
+            "ad_name": row["ad_name"],
+            "category": row["category"],
+            "voc_content": row["voc_content"],
+            "log_matching": row["log_matching"],
+            "daily_query_cnt": int(row["daily_query_cnt"]),
+            "actual_risk_level": row["actual_risk_level"],
+            "rule_flag": flag,
+            "analyzed_by": "Rule",
+            "risk_level": rule_level_map.get(flag, "Low"),
+            "risk_score": rule_score_map.get(flag, 20),
+            "is_grey_zone": False,
+            "reasoning": "Rule-based 자동 분류",
+        })
+
+    return results
 
 
-def reset_checkpoints():
-    """체크포인트 전체 초기화"""
-    for f in CHECKPOINT_DIR.glob("*.done"):
-        f.unlink()
-    log.info("체크포인트 초기화 완료")
+# ═══════════════════════════════════════════════════════════════
+#  Step 3: 결과 저장 + 검증 보고서
+# ═══════════════════════════════════════════════════════════════
+
+def save_results(results: list[dict]):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"\n✅ 결과 저장 완료: {RESULTS_FILE} ({len(results)}건)")
 
 
-def save_result(result: RiskResult):
-    with OUTPUT_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
+def generate_report(results: list[dict]):
+    """검증 보고서 생성."""
+    total = len(results)
+    correct = sum(1 for r in results if r["actual_risk_level"] == r["risk_level"])
+    accuracy = correct / total * 100 if total else 0
 
+    # 등급별 통계
+    level_stats: dict[str, dict] = defaultdict(lambda: {"total": 0, "correct": 0})
+    mismatches: list[dict] = []
 
-# ── Main Pipeline ─────────────────────────────────────────────────────────────
-
-def run_pipeline(input_csv: str, reset: bool = False):
-    log.info("=" * 60)
-    log.info(f"VoC Risk Pipeline 시작: {datetime.now().isoformat()}")
-    log.info(f"모델: {MODEL_ID} | 감사율: {RANDOM_AUDIT*100:.0f}%")
-
-    # 결과 파일 없는데 체크포인트만 남은 경우 자동 초기화 (이전 실패 런 방어)
-    if not reset and not OUTPUT_PATH.exists() and any(CHECKPOINT_DIR.glob("*.done")):
-        log.warning("결과 파일 없는데 체크포인트 발견 → 자동 초기화 (이전 런 실패 추정)")
-        reset = True
-
-    if reset:
-        reset_checkpoints()
-        if OUTPUT_PATH.exists():
-            OUTPUT_PATH.unlink()
-            log.info("기존 결과 파일 삭제")
-
-    # 1. 데이터 로드
-    df = pd.read_csv(input_csv, encoding="utf-8-sig")
-    log.info(f"전체 VoC: {len(df)}건")
-
-    # 필수 컬럼 보정 (없으면 기본값)
-    defaults = {"voc_id": "", "voc_content": "", "log_matching": "", "daily_query_cnt": 0}
-    for col, val in defaults.items():
-        if col not in df.columns:
-            df[col] = val
-            log.warning(f"컬럼 '{col}' 없음 → 기본값 '{val}' 사용")
-
-    # 2. Rule 필터링
-    candidates = rule_filter(df)
-
-    # 3. 체크포인트 로드
-    done_ids = load_done_ids()
-
-    # 4. LLM 분석 루프
-    skipped = failed = 0
-    for _, row in tqdm(candidates.iterrows(), total=len(candidates), desc="LLM 분석"):
-        vid = str(row["voc_id"])
-
-        if vid in done_ids:
-            skipped += 1
-            continue
-
-        raw = call_llm(row)
-
-        if raw is None:
-            result = RiskResult(
-                voc_id=vid,
-                risk_score=3,                              # 중간값 → 수동 검토
-                risk_type=str(row.get("_rule_type", "unknown")),
-                reason="LLM실패-수동검토",
-                triggered_by=str(row.get("triggered_by", "rule")),
-                processed_at=datetime.now().isoformat(),
-            )
-            failed += 1
-            # 실패 건은 mark_done 안 함 → 재실행 시 자동 재시도
-
+    for r in results:
+        actual = r["actual_risk_level"]
+        predicted = r["risk_level"]
+        level_stats[actual]["total"] += 1
+        if actual == predicted:
+            level_stats[actual]["correct"] += 1
         else:
-            score = max(1, min(5, int(raw.get("score", 3))))  # 1~5 범위 보정
-            result = RiskResult(
-                voc_id=vid,
-                risk_score=score,
-                risk_type=raw.get("type", "normal"),
-                reason=raw.get("reason", "")[:50],
-                triggered_by=str(row.get("triggered_by", "rule")),
-                processed_at=datetime.now().isoformat(),
-            )
-            mark_done(vid)  # 성공 건만 체크포인트
+            mismatches.append(r)
 
-        save_result(result)
-        time.sleep(0.1)   # Rate limit 방어 (10 RPS 목표)
+    # 보고서 작성
+    lines = [
+        "=" * 70,
+        "  VoC 리스크 자동 분류 — 검증 보고서 (Evaluation Report)",
+        "=" * 70,
+        "",
+        f"분석 일시     : {time.strftime('%Y-%m-%d %H:%M')}",
+        f"총 분석 건수  : {total}건",
+        f"LLM 분석 건수 : {sum(1 for r in results if r['analyzed_by'] == 'LLM')}건",
+        f"Rule 분류 건수: {sum(1 for r in results if r['analyzed_by'] == 'Rule')}건",
+        "",
+        "-" * 70,
+        "1. 전체 정확도 (Total Accuracy)",
+        "-" * 70,
+        f"   정확도: {accuracy:.1f}%  ({correct}/{total}건 일치)",
+        "",
+        "-" * 70,
+        "2. 등급별 일치율 (Per-Level Accuracy)",
+        "-" * 70,
+        f"   {'등급':<12s} {'건수':>6s} {'일치':>6s} {'일치율':>8s}",
+        f"   {'─'*12} {'─'*6} {'─'*6} {'─'*8}",
+    ]
 
-    # 5. 요약
-    log.info("=" * 60)
-    log.info(
-        f"완료: {len(candidates) - skipped}건 처리 "
-        f"| 스킵 {skipped}건 | 실패(수동검토) {failed}건"
-    )
-    log.info(f"결과: {OUTPUT_PATH.resolve()}")
+    for level in ["Critical", "High", "Medium", "Low", "Grey"]:
+        s = level_stats.get(level, {"total": 0, "correct": 0})
+        t, c = s["total"], s["correct"]
+        rate = f"{c/t*100:.1f}%" if t > 0 else "N/A"
+        lines.append(f"   {level:<12s} {t:>6d} {c:>6d} {rate:>8s}")
 
-    # 6. 결과 분포 출력
-    if OUTPUT_PATH.exists():
-        results_df = pd.read_json(OUTPUT_PATH, lines=True)
-        print("\n[리스크 타입 분포]")
-        print(results_df["risk_type"].value_counts().to_string())
-        print("\n[점수 분포 (1=단순, 5=즉시대응)]")
-        print(results_df["risk_score"].value_counts().sort_index().to_string())
-        urgent = results_df[results_df["risk_score"] == 5][["voc_id", "risk_type", "reason"]]
-        if not urgent.empty:
-            print(f"\n[즉시 대응 필요 (score=5) — {len(urgent)}건]")
-            print(urgent.to_string(index=False))
+    lines += [
+        "",
+        "-" * 70,
+        "3. 오답 사례 (Mismatched Cases) — 최대 5건",
+        "-" * 70,
+    ]
 
-    return OUTPUT_PATH
+    sample_mismatches = mismatches[:5] if len(mismatches) <= 5 else random.sample(mismatches, 5)
+    for i, m in enumerate(sample_mismatches, 1):
+        content_preview = m["voc_content"][:80] + ("..." if len(m["voc_content"]) > 80 else "")
+        lines += [
+            f"  [{i}] voc_id     : {m['voc_id']}",
+            f"      원문       : {content_preview}",
+            f"      실제 등급  : {m['actual_risk_level']}",
+            f"      LLM 등급   : {m['risk_level']}",
+            f"      LLM 사유   : {m['reasoning']}",
+            f"      분석 방식  : {m['analyzed_by']}",
+            "",
+        ]
+
+    if not sample_mismatches:
+        lines.append("  (오답 사례 없음)")
+
+    # 혼동 행렬 요약
+    lines += [
+        "-" * 70,
+        "4. 혼동 행렬 요약 (Confusion Summary)",
+        "-" * 70,
+    ]
+    confusion: dict[str, Counter] = defaultdict(Counter)
+    for r in results:
+        confusion[r["actual_risk_level"]][r["risk_level"]] += 1
+
+    all_levels = ["Critical", "High", "Medium", "Low", "Grey"]
+    label = "실제\\예측"
+    header = f"   {label:<10s}" + "".join(f"{l:>10s}" for l in all_levels)
+    lines.append(header)
+    lines.append(f"   {'─'*10}" + "─" * 50)
+    for actual in all_levels:
+        row_str = f"   {actual:<10s}"
+        for pred in all_levels:
+            row_str += f"{confusion[actual][pred]:>10d}"
+        lines.append(row_str)
+
+    lines += ["", "=" * 70, "  End of Report", "=" * 70]
+
+    report_text = "\n".join(lines)
+    with open(REPORT_FILE, "w", encoding="utf-8") as f:
+        f.write(report_text)
+
+    print(f"✅ 검증 보고서 저장 완료: {REPORT_FILE}")
+    print(f"\n{report_text}")
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# ─── 메인 ───────────────────────────────────────────────────
+
+def main():
+    random.seed(42)
+
+    # CSV 로드
+    if not DATA_FILE.exists():
+        sys.exit(f"❌ 데이터 파일 없음: {DATA_FILE}\n   먼저 gen_data.py를 실행하세요.")
+
+    with open(DATA_FILE, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    print(f"📂 데이터 로드 완료: {len(rows)}건")
+
+    # Step 1
+    print("\n" + "=" * 50)
+    print("Step 1: Rule-based Pre-Filtering")
+    print("=" * 50)
+    high_risk, rest = step1_filter(rows)
+    print(f"   고위험 후보: {len(high_risk)}건")
+    print(f"   나머지     : {len(rest)}건")
+
+    flag_counts = Counter(r["rule_flag"] for r in high_risk)
+    for flag, cnt in flag_counts.most_common():
+        print(f"     - {flag}: {cnt}건")
+
+    # Step 2
+    print("\n" + "=" * 50)
+    print("Step 2: LLM Precision Scoring (Gemini 2.0 Flash)")
+    print("=" * 50)
+    results = step2_llm_analysis(high_risk, rest)
+
+    # Step 3
+    print("\n" + "=" * 50)
+    print("Step 3: 결과 저장 + 검증 보고서 생성")
+    print("=" * 50)
+    save_results(results)
+    generate_report(results)
+
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="VoC Risk Pipeline")
-    parser.add_argument(
-        "csv", nargs="?",
-        default="../outputs/voc_data_4000.csv",
-        help="입력 CSV 경로 (기본: ../outputs/voc_data_4000.csv)",
-    )
-    parser.add_argument(
-        "--reset", action="store_true",
-        help="체크포인트·결과 초기화 후 처음부터 재실행",
-    )
-    args = parser.parse_args()
-    run_pipeline(args.csv, reset=args.reset)
+    main()

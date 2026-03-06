@@ -4,10 +4,13 @@
 
 # ── 보안: 절대 업로드 금지 ──────────────────────────────────
 .env
-.env.*
-*.env
+.env.local
+.env.production
 secrets.toml
 **/secrets.toml
+
+# .env.example은 업로드 허용 (API Key 설정 가이드용)
+!.env.example
 
 # ── Python 런타임 ────────────────────────────────────────────
 __pycache__/
@@ -28,9 +31,9 @@ ENV/
 src/checkpoints/
 checkpoints/
 
-# 분석 결과 JSONL (용량 크고 재생성 가능)
-src/voc_results.jsonl
-voc_results.jsonl
+# 분석 결과 JSONL — GitHub 포함 (대시보드 즉시 시연용)
+# src/voc_results.jsonl  ← 포함으로 변경
+# voc_results.jsonl      ← 포함으로 변경
 
 # 파이프라인 로그
 src/pipeline.log
