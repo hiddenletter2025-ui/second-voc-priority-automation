@@ -120,7 +120,7 @@ hr { border-color: #21262D !important; margin: 10px 0 !important; }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 
 SCORE_LABEL = {5: "Critical", 4: "High", 3: "Medium", 2: "Low", 1: "Minimal"}
 SCORE_COLOR = {5: "#FF4757", 4: "#FF6B35", 3: "#FFA502", 2: "#2ED573", 1: "#636E72"}
@@ -141,14 +141,17 @@ TYPE_KO = {
 BADGE_CLS = {5: "b5", 4: "b4", 3: "b3", 2: "b2", 1: "b1"}
 
 # 결과 파일 후보 경로 (우선순위 순)
+# app.py 위치 기준으로 가능한 모든 경로를 탐색
 RESULT_CANDIDATES = [
-    BASE_DIR / "src" / "voc_results.jsonl",
-    BASE_DIR / "voc_results.jsonl",
+    BASE_DIR / "src" / "voc_results.jsonl",   # 루트에서 실행 시
+    BASE_DIR / "voc_results.jsonl",            # src/ 안에서 실행 시
+    BASE_DIR.parent / "src" / "voc_results.jsonl",  # 하위 폴더에서 실행 시
 ]
 RAW_CANDIDATES = [
-    BASE_DIR / "outputs" / "voc_data_4000.csv",
-    BASE_DIR / "src" / "voc_data_4000.csv",
-    BASE_DIR / "voc_data_4000.csv",
+    BASE_DIR / "outputs" / "voc_data_4000.csv",        # 루트에서 실행 (현재 구조)
+    BASE_DIR / "src" / "voc_data_4000.csv",            # src/ 안에 있는 경우
+    BASE_DIR / "voc_data_4000.csv",                    # 루트에 있는 경우
+    BASE_DIR.parent / "outputs" / "voc_data_4000.csv", # 하위 폴더에서 실행 시
 ]
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
@@ -162,7 +165,7 @@ def load_data():
     if result_path is None:
         return None, (
             f"분석 결과 파일(`voc_results.jsonl`)을 찾을 수 없습니다.\n\n"
-            f"**먼저 파이프라인을 실행하세요:**\n```bash\ncd src\npython analyze_voc.py voc_data_4000.csv\n```"
+            f"**먼저 파이프라인을 실행하세요:**\n```bash\ncd src\npython analyze_voc.py ../outputs/voc_data_4000.csv\n```"
         )
 
     # 2. JSONL 파싱
